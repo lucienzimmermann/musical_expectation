@@ -1,14 +1,12 @@
 from psychopy import prefs
-prefs.hardware['audioLib'] = ['sounddevice']
+prefs.hardware['audioLib'] = ['PTB']
 
 import os
 import random
 import csv
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
-from psychopy import visual, core, event
-import serial
+from psychopy import visual, core, event, sound
 
 # ==============================
 # -------- PARAMETERS ----------
@@ -22,14 +20,6 @@ OUTPUT_FILE = "results.csv"
 
 contexts = ["context_1", "context_2"]
 
-# ==============================
-# -------- EEG TRIGGER ---------
-# ==============================
-
-TRIGGER_PORT = "COM3"   # change depending on your system
-TRIGGER_BAUD = 115200
-
-trigger = serial.Serial(TRIGGER_PORT, TRIGGER_BAUD)
 
 # ==============================
 # -------- LOAD FILES ----------
@@ -97,9 +87,9 @@ question_text = visual.TextStim(
     win,
     text="How surprising was the last chord?\n\n1 = Not surprising at all\n5 = Moderately surprising\n9 = Highly surprising",
     color="white",
-    height=0.08,  # Larger text
+    height=0.08,
     wrapWidth=1.5,
-    pos=(0, 0.2),  # Centered higher on the screen
+    pos=(0, 0.2),
     alignText="center"
 )
 
@@ -108,21 +98,21 @@ buttons = []
 labels = []
 
 for i in range(9):
-    x_pos = -0.4 + i * 0.1  # Adjusted spacing for better centering
-    rect = visual.Rect(
+    x_pos = -0.4 + i * 0.1
+    w, h = 0.04, 0.04  # half-width, half-height
+    rect = visual.ShapeStim(
         win,
-        width=0.08,
-        height=0.08,
+        vertices=[[-w, -h], [w, -h], [w, h], [-w, h]],
         pos=(x_pos, -0.2),
-        fillColor="darkgrey",  # Softer color
-        lineColor="white",    # White border for contrast
-        lineWidth=2
+        fillColor="darkgrey",
+        lineColor="white",
+        closeShape=True
     )
     label = visual.TextStim(
         win,
         text=str(i+1),
         pos=(x_pos, -0.2),
-        height=0.06,  # Larger label
+        height=0.06,
         color="white"
     )
 
@@ -132,6 +122,15 @@ for i in range(9):
 # Mouse setup
 mouse = event.Mouse(win=win)
 
+# ==============================
+# ---- WHITE NOISE SETUP -------
+# ==============================
+
+NOISE_DURATION = 1.0
+NOISE_SR = 44100
+noise_array = np.random.normal(0, 0.2, int(NOISE_SR * NOISE_DURATION)) * 0.10
+# PsychoPy Sound expects shape (n_samples, n_channels) or (n_samples,)
+white_noise_sound = sound.Sound(noise_array, sampleRate=NOISE_SR, stereo=False)
 
 # ==============================
 # -------- RUN EXPERIMENT ------
@@ -146,9 +145,6 @@ fixation = visual.TextStim(
     color="white",
     height=0.2)
 
-NOISE_DURATION = 1.0
-NOISE_SR = 44100
-white_noise = np.random.normal(0, 0.2, int(NOISE_SR * NOISE_DURATION)) * 0.10
 
 def check_quit():
     keys = event.getKeys()
@@ -161,7 +157,7 @@ try:
     for trial in selected_trials:
 
         # -------- START SCREEN --------
-        if counter == 0 :
+        if counter == 0:
             start_text = visual.TextStim(
                 win,
                 text="Press SPACE when you are ready to start the experiment\n\n(Press Q or ESC to quit)",
@@ -172,10 +168,9 @@ try:
 
             waiting = True
             while waiting:
-
                 start_text.draw()
                 win.flip()
-                counter = counter+1
+                counter = counter + 1
                 keys = event.getKeys()
 
                 if "space" in keys:
@@ -197,20 +192,25 @@ try:
 
         # ---- FIXATION + PLAYBACK -----
 
-        data, samplerate = sf.read(trial["file"])
-        duration = len(data) / samplerate
+        # Load and mix down to mono manually
+        snd_data, snd_sr = sf.read(trial["file"])
+        if snd_data.ndim > 1:
+            snd_data = snd_data.mean(axis=1)  # stereo -> mono
+        snd_data = snd_data.astype(np.float32)
+        duration = len(snd_data) / snd_sr
 
-        sd.play(data, samplerate)
+        trial_sound = sound.Sound(snd_data, sampleRate=snd_sr, stereo=False)
+
+        trial_sound.play()
 
         clock = core.Clock()
         while clock.getTime() < duration:
             if check_quit():
                 raise KeyboardInterrupt
-            
             fixation.draw()
             win.flip()
 
-        sd.wait()
+        trial_sound.stop()
 
         # -------- RATING --------------
 
@@ -266,8 +266,9 @@ try:
 
         # -------- WHITE NOISE ---------
 
-        sd.play(white_noise, NOISE_SR)
-        sd.wait()
+        white_noise_sound.play()
+        core.wait(NOISE_DURATION)
+        white_noise_sound.stop()
 
         # -------- PAUSE ---------------
 
