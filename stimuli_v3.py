@@ -1,0 +1,376 @@
+# ==============================
+# CHORD SEQUENCE EXPERIMENT
+# Optimized for Scarlett 2i2 on Windows + PTB
+# ==============================
+
+import os
+import sys
+import random
+import csv
+import atexit
+import shutil
+import tempfile
+import numpy as np
+import soundfile as sf
+from psychopy import visual, core, event, prefs
+
+prefs.hardware['audioLib'] = ['PTB']
+import psychtoolbox as ptb_audio
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ==============================
+# PARAMETERS
+# ==============================
+
+BASE_PATH      = "chords_sequences"
+N_TRIALS       = 30
+BREAK_MEAN     = 1.5
+BREAK_JITTER   = 0.3
+OUTPUT_FILE    = "results.csv"
+DEVICE_SR      = 44100
+NOISE_DURATION = 1.0
+CONTEXTS       = ["context_1", "context_2"]
+TRIGGER_MAP    = {"context_1": 10, "context_2": 20}
+PTB_DEVICE_IDX = 4          # Scarlett 2i2; change if needed
+START_FULLSCREEN = "--windowed" not in sys.argv
+
+if N_TRIALS % len(CONTEXTS) != 0:
+    raise ValueError(f"N_TRIALS ({N_TRIALS}) must be divisible by {len(CONTEXTS)}")
+
+# ==============================
+# TRIGGER SETUP
+# ==============================
+
+def _open_trigger(port="COM3", baud=115200):
+    if serial is None:
+        print("pyserial not installed — triggers disabled.")
+        return None
+    try:
+        s = serial.Serial(port=port, baudrate=baud, timeout=0)
+        s.write(bytes([0]))
+        print(f"TriggerBox connected on {port}")
+        return s
+    except Exception as e:
+        print(f"TriggerBox unavailable ({e}) — triggers disabled.")
+        return None
+
+trigger_port = _open_trigger()
+
+# ==============================
+# AUDIO HELPERS
+# ==============================
+
+_tmp_dir = tempfile.mkdtemp(prefix="chord_exp_")
+atexit.register(shutil.rmtree, _tmp_dir, ignore_errors=True)
+
+def load_mono_float32(filepath, target_sr=DEVICE_SR):
+    """Load a wav file, mix to mono, resample if needed. Returns float32 1-D array."""
+    data, sr = sf.read(filepath, always_2d=False)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    data = data.astype(np.float32)
+    if sr != target_sr:
+        try:
+            import resampy
+            data = resampy.resample(data, sr, target_sr)
+        except ImportError:
+            n = int(round(len(data) * target_sr / sr))
+            data = np.interp(np.linspace(0, len(data) - 1, n),
+                             np.arange(len(data)), data).astype(np.float32)
+        print(f"  {os.path.basename(filepath)}: resampled {sr} → {target_sr} Hz")
+    return data
+
+def rms(arr): #for white noise
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+def normalize_to_rms(arr, target_rms):#for white noise
+    """Scale arr so its RMS equals target_rms."""
+    r = rms(arr)
+    return arr * (target_rms / r) if r > 1e-9 else arr
+
+# ==============================
+# LOAD & BALANCE TRIALS: each run pick 15 of each context, with replacement, so 30 chords progression are picked (in parameters)
+# ==============================
+
+files_dict = {}
+for ctx in CONTEXTS:
+    path = os.path.join(BASE_PATH, ctx)
+    if not os.path.exists(path):
+        raise ValueError(f"Folder not found: {path}")
+    wavs = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".wav")]
+    if not wavs:
+        raise ValueError(f"No .wav files in: {path}")
+    files_dict[ctx] = wavs
+
+trials_per_context = N_TRIALS // len(CONTEXTS)
+selected_trials = []
+for ctx in CONTEXTS:
+    pool = files_dict[ctx]
+    chosen = (random.sample(pool, trials_per_context)
+              if len(pool) >= trials_per_context
+              else random.choices(pool, k=trials_per_context))
+    for f in chosen:
+        selected_trials.append({"context": ctx, "file": f, "name": os.path.basename(f)})
+random.shuffle(selected_trials)
+
+print(f"\nTrial order ({len(selected_trials)} trials):")
+for t in selected_trials:
+    print(f"  [{t['context']}] {t['name']}")
+
+# ==============================
+# AUDIO SETUP — direct PTB stream
+# ==============================
+
+print("\nOpening PTB audio stream...")
+_ptb_handle = ptb_audio.PsychPortAudio('Open', PTB_DEVICE_IDX, 1, 4, DEVICE_SR, 2)
+print(f"PTB stream handle: {_ptb_handle}")
+
+# Pre-load all chord audio
+print("Preloading audio...")
+_audio_cache = {}
+for trial in selected_trials:
+    src = trial["file"]
+    if src not in _audio_cache:
+        _audio_cache[src] = load_mono_float32(src)
+    trial["audio_array"] = _audio_cache[src]
+    trial["duration"]    = len(_audio_cache[src]) / DEVICE_SR
+
+# Match white noise RMS to mean chord RMS
+_mean_chord_rms = float(np.mean([rms(a) for a in _audio_cache.values()]))
+_raw_noise = np.random.normal(0, 1.0, int(DEVICE_SR * NOISE_DURATION)).astype(np.float32)
+_noise_array = normalize_to_rms(_raw_noise, _mean_chord_rms)
+print(f"Noise RMS matched to chords: {_mean_chord_rms:.5f}")
+print("All audio preloaded.\n")
+
+def _to_stereo(mono):
+    """Duplicate mono array to (2, N) interleaved layout PTB expects."""
+    return np.column_stack([mono, mono])
+
+def ptb_play(array):
+    """Load buffer and start non-blocking playback."""
+    ptb_audio.PsychPortAudio('FillBuffer', _ptb_handle, _to_stereo(array))
+    ptb_audio.PsychPortAudio('Start', _ptb_handle, 1, 0, 1)  # repetitions=1 → no looping
+
+def ptb_stop():
+    ptb_audio.PsychPortAudio('Stop', _ptb_handle)
+
+def ptb_wait_until_done(timeout=30.0):
+    """Block until PTB reports playback finished (avoids clipping the tail)."""
+    t0 = core.getTime()
+    while core.getTime() - t0 < timeout:
+        status = ptb_audio.PsychPortAudio('GetStatus', _ptb_handle)
+        if not status['Active']:
+            return
+        core.wait(0.005, hogCPUperiod=0)
+
+# ==============================
+# WINDOW & UI
+# ==============================
+
+win = visual.Window(
+    size=[1280, 720],
+    fullscr=START_FULLSCREEN,
+    color="black",
+    units="height",
+    allowGUI=True,          # allows window dragging in windowed mode
+)
+
+fixation = visual.TextStim(win, text="+", color="white", height=0.2)
+
+question_text = visual.TextStim(
+    win,
+    text=(
+        "How complete did the chord sequence feel?\n\n"
+        "1 = Not surprising at all\n"
+        "5 = Moderately surprising\n"
+        "9 = Highly surprising"
+    ),
+    color="white", height=0.06, wrapWidth=1.5, pos=(0, 0.2), alignText="center",
+)
+
+start_text = visual.TextStim(
+    win,
+    text=(
+        "Press SPACE to start\n\n"
+        "F = toggle fullscreen   M = windowed mode\n"
+        "Q / ESC = quit"
+    ),
+    color="white", height=0.06, wrapWidth=1.5, alignText="center",
+)
+
+hint_text = visual.TextStim(
+    win, text="F = fullscreen  M = windowed  Q = quit",
+    color="grey", height=0.035, pos=(0, -0.45),
+)
+
+# Rating buttons
+_BW, _BH = 0.04, 0.04
+buttons, labels = [], []
+for i in range(9):
+    x = -0.4 + i * 0.1
+    buttons.append(visual.ShapeStim(
+        win,
+        vertices=[[-_BW, -_BH], [_BW, -_BH], [_BW, _BH], [-_BW, _BH]],
+        pos=(x, -0.2), fillColor="darkgrey", lineColor="white", closeShape=True,
+    ))
+    labels.append(visual.TextStim(win, text=str(i + 1), pos=(x, -0.2),
+                                  height=0.06, color="white"))
+
+mouse = event.Mouse(win=win)
+
+# ==============================
+# RUNTIME HELPERS
+# ==============================
+
+def toggle_fullscreen():
+    win.fullscr = not win.fullscr
+    win._isFullScr = win.fullscr
+    win.winHandle.set_fullscreen(win.fullscr)
+    win.winHandle.activate()
+
+def set_windowed():
+    if win.fullscr:
+        toggle_fullscreen()
+
+def check_window_keys():
+    """Handle window-management keys. Returns True if quit requested."""
+    keys = event.getKeys()
+    if set(keys) & {'q', 'escape'}:
+        return True
+    if 'f' in keys:
+        toggle_fullscreen()
+    if 'm' in keys:
+        set_windowed()
+    return False
+
+def send_trigger(code):
+    if trigger_port is None:
+        return
+    try:
+        trigger_port.write(bytes([code]))
+        core.wait(0.010)
+        trigger_port.write(bytes([0]))
+    except Exception as e:
+        print(f"Trigger error: {e}")
+
+def wait_blank(duration):
+    clock = core.Clock()
+    while clock.getTime() < duration:
+        if check_window_keys():
+            raise KeyboardInterrupt
+        win.flip()
+
+def get_rating():
+    """Display rating screen and return 1–9 via mouse click or keyboard."""
+    mouse.clickReset()
+    while True:
+        if check_window_keys():
+            raise KeyboardInterrupt
+        question_text.draw()
+        for rect, lbl in zip(buttons, labels):
+            rect.draw()
+            lbl.draw()
+        hint_text.draw()
+        win.flip()
+        for i, rect in enumerate(buttons):
+            if mouse.isPressedIn(rect):
+                core.wait(0.2)
+                return i + 1
+        for key in event.getKeys():
+            if key in [str(i) for i in range(1, 10)]:
+                core.wait(0.2)
+                return int(key)
+
+# ==============================
+# RUN EXPERIMENT
+# ==============================
+
+results = []
+
+try:
+    # Start screen
+    while True:
+        start_text.draw()
+        win.flip()
+        keys = event.getKeys()
+        if "space" in keys:
+            break
+        if set(keys) & {'q', 'escape'}:
+            raise KeyboardInterrupt
+        if 'f' in keys:
+            toggle_fullscreen()
+        if 'm' in keys:
+            set_windowed()
+
+    for trial_num, trial in enumerate(selected_trials):
+        print(f"\nTrial {trial_num + 1}/{len(selected_trials)}: "
+              f"{trial['name']} [{trial['context']}]")
+
+        # Pre-trial blank
+        wait_blank(BREAK_MEAN)
+
+        trigger_code = TRIGGER_MAP.get(trial["context"], 0)
+
+        # Fixation + trigger + play
+        fixation.draw()
+        win.flip()
+        send_trigger(trigger_code)
+        ptb_play(trial["audio_array"])
+
+        # Wait for playback to finish naturally (no repeat artifact)
+        ptb_wait_until_done(timeout=trial["duration"])
+
+        # Keep fixation visible during playback
+        while True:
+            status = ptb_audio.PsychPortAudio('GetStatus', _ptb_handle)
+            if not status['Active']:
+                break
+            if check_window_keys():
+                raise KeyboardInterrupt
+            fixation.draw()
+            win.flip()
+
+        ptb_stop()
+
+        # Rating
+        rating = get_rating()
+        print(f"  Rating: {rating}")
+        results.append({
+            "chord progression name": trial["name"],
+            "context": trial["context"],
+            "grade": rating,
+        })
+
+        win.flip()
+
+        # Post-trial blank + noise + second blank
+        jitter = np.random.uniform(-BREAK_JITTER, BREAK_JITTER)
+        wait_blank(BREAK_MEAN + jitter)
+
+        ptb_play(_noise_array)
+        ptb_wait_until_done(timeout=NOISE_DURATION + 1.0)
+        ptb_stop()
+
+        wait_blank(BREAK_MEAN - 1.0)
+
+except KeyboardInterrupt:
+    print("\nExperiment interrupted by user.")
+
+# ==============================
+# SAVE & CLOSE
+# ==============================
+
+with open(OUTPUT_FILE, mode='w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=["chord progression name", "context", "grade"])
+    writer.writeheader()
+    writer.writerows(results)
+
+print(f"\nResults saved to {OUTPUT_FILE}  ({len(results)} trials recorded)")
+
+ptb_audio.PsychPortAudio('Close', _ptb_handle)
+win.close()
+core.quit()
