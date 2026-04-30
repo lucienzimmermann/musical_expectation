@@ -1,6 +1,7 @@
 # ==============================
 # CHORD SEQUENCE EXPERIMENT
 # Optimized for Scarlett 2i2 on Windows + PTB
+# Precision-timed triggers via scheduled PTB onset + spin-loop
 # ==============================
 
 import os
@@ -10,6 +11,7 @@ import csv
 import atexit
 import shutil
 import tempfile
+
 import numpy as np
 import soundfile as sf
 from psychopy import visual, core, event, prefs
@@ -22,35 +24,80 @@ try:
 except ImportError:
     serial = None
 
+# ── raise process priority ──────────────────────────────────────────────────
+try:
+    import psutil
+    p = psutil.Process()
+    if sys.platform == "win32":
+        p.nice(psutil.HIGH_PRIORITY_CLASS)
+        print("Process priority → HIGH (Windows)")
+    else:
+        p.nice(-10)
+        print("Process nice → -10 (POSIX)")
+except Exception as e:
+    print(f"Could not raise priority ({e}) — continuing anyway.")
+
 # ==============================
 # PARAMETERS
 # ==============================
 
-BASE_PATH      = "chords_sequences"
-N_TRIALS       = 30
-BREAK_MEAN     = 1.5
-BREAK_JITTER   = 0.3
-OUTPUT_FILE    = "results.csv"
-DEVICE_SR      = 44100
-NOISE_DURATION = 1.0
-CONTEXTS       = ["context_1", "context_2"]
-TRIGGER_MAP    = {"context_1": 10, "context_2": 20}
-PTB_DEVICE_IDX = 4          # Scarlett 2i2; change if needed
-START_FULLSCREEN = "--windowed" not in sys.argv
+BASE_PATH         = "chords_sequences"
+N_TRIALS          = 30
+BREAK_MEAN        = 1.5
+BREAK_JITTER      = 0.3
+OUTPUT_FILE       = "results.csv"
+DEVICE_SR         = 44100
+NOISE_DURATION    = 1.0
+CONTEXTS          = ["context_1", "context_2"]
+TRIGGER_MAP       = {"context_1": 10, "context_2": 20}
+PTB_LATENCY_CLASS = 4          # 1=low, 2=aggressive, 4=critical (ASIO/CoreAudio)
+SCHEDULED_LEAD    = 0.050      # seconds PTB is armed ahead of trigger spin-loop
+TRIGGER_PORT      = "COM3"
+TRIGGER_BAUD      = 115200
+TRIGGER_RESET_DELAY = 0.001    # 1 ms — BP TriggerBox minimum pulse width
+START_FULLSCREEN  = "--windowed" not in sys.argv
 
 if N_TRIALS % len(CONTEXTS) != 0:
     raise ValueError(f"N_TRIALS ({N_TRIALS}) must be divisible by {len(CONTEXTS)}")
 
 # ==============================
+# DEVICE SELECTION
+# ==============================
+
+def choose_ptb_device():
+    """List available PTB devices and ask user to select one."""
+    devices = ptb_audio.PsychPortAudio('GetDevices')
+    print("\nAvailable audio devices:\n")
+    valid_devices = []
+    for i, dev in enumerate(devices):
+        if dev['NrOutputChannels'] > 0:
+            print(f"[{i}] {dev['DeviceName']} "
+                  f"(Outputs: {dev['NrOutputChannels']}, "
+                  f"Host API: {dev['HostAudioAPIName']})")
+            valid_devices.append(i)
+    if not valid_devices:
+        raise RuntimeError("No output audio devices found!")
+    while True:
+        try:
+            choice = int(input("\nEnter device index: "))
+            if choice in valid_devices:
+                return choice
+            print("Invalid choice. Pick a listed index.")
+        except ValueError:
+            print("Please enter a number.")
+
+PTB_DEVICE_IDX = choose_ptb_device()
+
+# ==============================
 # TRIGGER SETUP
 # ==============================
 
-def _open_trigger(port="COM3", baud=115200):
+def _open_trigger(port=TRIGGER_PORT, baud=TRIGGER_BAUD):
     if serial is None:
         print("pyserial not installed — triggers disabled.")
         return None
     try:
-        s = serial.Serial(port=port, baudrate=baud, timeout=0)
+        s = serial.Serial(port=port, baudrate=baud, timeout=0, write_timeout=0)
         s.write(bytes([0]))
         print(f"TriggerBox connected on {port}")
         return s
@@ -60,12 +107,28 @@ def _open_trigger(port="COM3", baud=115200):
 
 trigger_port = _open_trigger()
 
+
+def send_trigger(code):
+    """
+    Send trigger ON, busy-wait for reset delay, send trigger OFF.
+    hogCPUperiod keeps the CPU pinned — no OS scheduler wake-up jitter.
+    """
+    if trigger_port is None:
+        return
+    try:
+        trigger_port.write(bytes([code]))
+        core.wait(TRIGGER_RESET_DELAY, hogCPUperiod=TRIGGER_RESET_DELAY)
+        trigger_port.write(bytes([0]))
+    except Exception as e:
+        print(f"Trigger error: {e}")
+
 # ==============================
 # AUDIO HELPERS
 # ==============================
 
 _tmp_dir = tempfile.mkdtemp(prefix="chord_exp_")
 atexit.register(shutil.rmtree, _tmp_dir, ignore_errors=True)
+
 
 def load_mono_float32(filepath, target_sr=DEVICE_SR):
     """Load a wav file, mix to mono, resample if needed. Returns float32 1-D array."""
@@ -84,16 +147,22 @@ def load_mono_float32(filepath, target_sr=DEVICE_SR):
         print(f"  {os.path.basename(filepath)}: resampled {sr} → {target_sr} Hz")
     return data
 
-def rms(arr): #for white noise
+
+def rms(arr):
     return float(np.sqrt(np.mean(arr ** 2)))
 
-def normalize_to_rms(arr, target_rms):#for white noise
-    """Scale arr so its RMS equals target_rms."""
+
+def normalize_to_rms(arr, target_rms):
     r = rms(arr)
     return arr * (target_rms / r) if r > 1e-9 else arr
 
+
+def _to_stereo(mono):
+    """Duplicate mono array to (2, N) interleaved layout PTB expects."""
+    return np.column_stack([mono, mono])
+
 # ==============================
-# LOAD & BALANCE TRIALS: each run pick 15 of each context, with replacement, so 30 chords progression are picked (in parameters)
+# LOAD & BALANCE TRIALS
 # ==============================
 
 files_dict = {}
@@ -122,14 +191,15 @@ for t in selected_trials:
     print(f"  [{t['context']}] {t['name']}")
 
 # ==============================
-# AUDIO SETUP — direct PTB stream
+# AUDIO SETUP
 # ==============================
 
 print("\nOpening PTB audio stream...")
-_ptb_handle = ptb_audio.PsychPortAudio('Open', PTB_DEVICE_IDX, 1, 4, DEVICE_SR, 2)
+_ptb_handle = ptb_audio.PsychPortAudio(
+    'Open', PTB_DEVICE_IDX, 1, PTB_LATENCY_CLASS, DEVICE_SR, 2
+)
 print(f"PTB stream handle: {_ptb_handle}")
 
-# Pre-load all chord audio
 print("Preloading audio...")
 _audio_cache = {}
 for trial in selected_trials:
@@ -139,29 +209,54 @@ for trial in selected_trials:
     trial["audio_array"] = _audio_cache[src]
     trial["duration"]    = len(_audio_cache[src]) / DEVICE_SR
 
-# Match white noise RMS to mean chord RMS
 _mean_chord_rms = float(np.mean([rms(a) for a in _audio_cache.values()]))
 _raw_noise = np.random.normal(0, 1.0, int(DEVICE_SR * NOISE_DURATION)).astype(np.float32)
 _noise_array = normalize_to_rms(_raw_noise, _mean_chord_rms)
 print(f"Noise RMS matched to chords: {_mean_chord_rms:.5f}")
 print("All audio preloaded.\n")
 
-def _to_stereo(mono):
-    """Duplicate mono array to (2, N) interleaved layout PTB expects."""
-    return np.column_stack([mono, mono])
+# ==============================
+# PRECISION PLAY FUNCTION
+# ==============================
 
-def ptb_play(array):
-    """Load buffer and start non-blocking playback."""
+def ptb_play_scheduled(array, trigger_code, lead=SCHEDULED_LEAD):
+    """
+    Fill buffer, schedule playback LEAD seconds from now, then spin until
+    that moment and send the EEG trigger.
+
+    The trigger is sent at the exact scheduled hardware onset rather than
+    before PTB scheduling, eliminating variable scheduling overhead from
+    the trigger-to-audio alignment.
+    """
     ptb_audio.PsychPortAudio('FillBuffer', _ptb_handle, _to_stereo(array))
-    ptb_audio.PsychPortAudio('Start', _ptb_handle, 1, 0, 1)  # repetitions=1 → no looping
+
+    t_scheduled = ptb_audio.GetSecs() + lead
+    ptb_audio.PsychPortAudio('Start', _ptb_handle, 1, t_scheduled, 0)
+
+    # Spin-wait until scheduled moment — no OS sleep, stays on CPU
+    while ptb_audio.GetSecs() < t_scheduled:
+        pass
+
+    send_trigger(trigger_code)
+
+
+def ptb_play_plain(array):
+    """
+    Non-triggered playback (used for noise bursts).
+    Simple fill + start, no scheduling needed.
+    """
+    ptb_audio.PsychPortAudio('FillBuffer', _ptb_handle, _to_stereo(array))
+    ptb_audio.PsychPortAudio('Start', _ptb_handle, 1, 0, 1)
+
 
 def ptb_stop():
     ptb_audio.PsychPortAudio('Stop', _ptb_handle)
 
+
 def ptb_wait_until_done(timeout=30.0):
-    """Block until PTB reports playback finished (avoids clipping the tail)."""
-    t0 = core.getTime()
-    while core.getTime() - t0 < timeout:
+    """Block until PTB reports playback finished."""
+    t0 = ptb_audio.GetSecs()
+    while ptb_audio.GetSecs() - t0 < timeout:
         status = ptb_audio.PsychPortAudio('GetStatus', _ptb_handle)
         if not status['Active']:
             return
@@ -176,7 +271,7 @@ win = visual.Window(
     fullscr=START_FULLSCREEN,
     color="black",
     units="height",
-    allowGUI=True,          # allows window dragging in windowed mode
+    allowGUI=True,
 )
 
 fixation = visual.TextStim(win, text="+", color="white", height=0.2)
@@ -207,7 +302,6 @@ hint_text = visual.TextStim(
     color="grey", height=0.035, pos=(0, -0.45),
 )
 
-# Rating buttons
 _BW, _BH = 0.04, 0.04
 buttons, labels = [], []
 for i in range(9):
@@ -232,9 +326,11 @@ def toggle_fullscreen():
     win.winHandle.set_fullscreen(win.fullscr)
     win.winHandle.activate()
 
+
 def set_windowed():
     if win.fullscr:
         toggle_fullscreen()
+
 
 def check_window_keys():
     """Handle window-management keys. Returns True if quit requested."""
@@ -247,22 +343,15 @@ def check_window_keys():
         set_windowed()
     return False
 
-def send_trigger(code):
-    if trigger_port is None:
-        return
-    try:
-        trigger_port.write(bytes([code]))
-        core.wait(0.010)
-        trigger_port.write(bytes([0]))
-    except Exception as e:
-        print(f"Trigger error: {e}")
 
 def wait_blank(duration):
-    clock = core.Clock()
-    while clock.getTime() < duration:
+    """Blank-screen wait using PTB clock; checks for quit."""
+    t_end = ptb_audio.GetSecs() + duration
+    while ptb_audio.GetSecs() < t_end:
         if check_window_keys():
             raise KeyboardInterrupt
         win.flip()
+
 
 def get_rating():
     """Display rating screen and return 1–9 via mouse click or keyboard."""
@@ -315,16 +404,17 @@ try:
 
         trigger_code = TRIGGER_MAP.get(trial["context"], 0)
 
-        # Fixation + trigger + play
+        # Fixation on screen
         fixation.draw()
         win.flip()
-        send_trigger(trigger_code)
-        ptb_play(trial["audio_array"])
 
-        # Wait for playback to finish naturally (no repeat artifact)
-        ptb_wait_until_done(timeout=trial["duration"])
+        # ── CRITICAL SECTION ──────────────────────────────────────────────
+        # PTB schedules audio SCHEDULED_LEAD ahead; spin-loop fires the
+        # trigger at the exact scheduled onset.
+        ptb_play_scheduled(trial["audio_array"], trigger_code)
+        # ─────────────────────────────────────────────────────────────────
 
-        # Keep fixation visible during playback
+        # Keep fixation visible while audio plays
         while True:
             status = ptb_audio.PsychPortAudio('GetStatus', _ptb_handle)
             if not status['Active']:
@@ -341,8 +431,8 @@ try:
         print(f"  Rating: {rating}")
         results.append({
             "chord progression name": trial["name"],
-            "context": trial["context"],
-            "grade": rating,
+            "context":                trial["context"],
+            "grade":                  rating,
         })
 
         win.flip()
@@ -351,7 +441,7 @@ try:
         jitter = np.random.uniform(-BREAK_JITTER, BREAK_JITTER)
         wait_blank(BREAK_MEAN + jitter)
 
-        ptb_play(_noise_array)
+        ptb_play_plain(_noise_array)
         ptb_wait_until_done(timeout=NOISE_DURATION + 1.0)
         ptb_stop()
 
